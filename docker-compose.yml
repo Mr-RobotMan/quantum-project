@@ -36,7 +36,7 @@ services:
     volumes:
       - results_data:/app/results_store_data
     environment:
-      - DB_PATH=/app/results_store_data/results.db
+      - DB_PATH=/app/results_store_data/${RESULTS_DB:-results.db}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       <<: *healthcheck
@@ -61,8 +61,23 @@ services:
       context: .
       dockerfile: data_loader/Dockerfile
     volumes:
-      - ./12_Industry_Portfolios_Daily.csv:/app/12_Industry_Portfolios_Daily.csv:ro
       - processed_data:/app/data/processed
+    environment:
+      - RAW_RETURNS_FILE=/app/${RAW_RETURNS_CSV:-12_Industry_Portfolios_Daily.csv}
+      - RETURNS_FILE=/app/data/processed/${RETURNS_CSV:-daily_returns.csv}
+    profiles:
+      - tools
+
+  # Run after data-loader: trains walk-forward and writes mu_hat.csv for the orchestrator.
+  forecaster:
+    build:
+      context: .
+      dockerfile: forecaster/Dockerfile
+    volumes:
+      - processed_data:/app/data/processed
+    environment:
+      - RETURNS_FILE=/app/data/processed/${RETURNS_CSV:-daily_returns.csv}
+      - MU_HAT_FILE=/app/data/processed/${MU_HAT_CSV:-mu_hat.csv}
     profiles:
       - tools
 
@@ -74,12 +89,13 @@ services:
       - processed_data:/app/data/processed
       - results_data:/app/results_store_data
     environment:
-      - DB_PATH=/app/results_store_data/results.db
-      - RETURNS_FILE=/app/data/processed/daily_returns.csv
+      - DB_PATH=/app/results_store_data/${RESULTS_DB:-results.db}
+      - RETURNS_FILE=/app/data/processed/${RETURNS_CSV:-daily_returns.csv}
+      - MU_HAT_FILE=/app/data/processed/${MU_HAT_CSV:-mu_hat.csv}
       - BACKTEST_MARKOWITZ_URL=http://markowitz-service:8000/optimize
       - BACKTEST_QAOA_URL=http://qaoa-service:8000/optimize
-      - BACKTEST_START_DATE=${BACKTEST_START_DATE:-2024-01-01}
-      - BACKTEST_END_DATE=${BACKTEST_END_DATE:-2024-03-31}
+      - BACKTEST_START_DATE=${BACKTEST_START_DATE:-}
+      - BACKTEST_END_DATE=${BACKTEST_END_DATE:-}
       - BACKTEST_WINDOW_DAYS=${BACKTEST_WINDOW_DAYS:-252}
       - BACKTEST_TCOST_BPS=${BACKTEST_TCOST_BPS:-10.0}
       - BACKTEST_RISK_AVERSION=${BACKTEST_RISK_AVERSION:-1.0}
@@ -92,11 +108,11 @@ services:
       - tools
 
   prometheus:
-    image: prom/prometheus:v2.45.0
+    build:
+      context: .
+      dockerfile: Dockerfile.prometheus
     ports:
       - "9090:9090"
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
 
   grafana:
     image: grafana/grafana:10.0.3

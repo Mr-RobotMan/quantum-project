@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data_loader.lookup import sigma_for_date, caps_for_date
 from backtest_orchestrator.config import settings
-from backtest_orchestrator.forecaster import get_mu_hat
+from backtest_orchestrator.forecaster import get_mu_hat, MuHatUnavailableError, MU_HAT_HORIZON_DAYS
 from shared_contracts.contracts import OptimizationRequest, OptimizationResult
 from results_store.db import init_db, insert_result, compute_hash
 
@@ -55,15 +55,52 @@ def compute_realized_return(
             
     return port_return
 
+def resolve_backtest_bounds(returns_df: pd.DataFrame, start_date: str | pd.Timestamp | None = None, end_date: str | pd.Timestamp | None = None, min_window_days: int = 252) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Return the inclusive date range to evaluate the backtest.
+
+    By default this uses the full history in the cleaned returns file so every
+    available weekly rebalance can be assessed. When explicit bounds are passed,
+    they override the dataset defaults.
+    """
+    dataset_start = returns_df.index.min()
+    dataset_end = returns_df.index.max()
+
+    if start_date is not None and str(start_date).strip() == "":
+        start_date = None
+    if end_date is not None and str(end_date).strip() == "":
+        end_date = None
+
+    resolved_start = pd.to_datetime(start_date) if start_date is not None else dataset_start
+    resolved_end = pd.to_datetime(end_date) if end_date is not None else dataset_end
+
+    if resolved_start < dataset_start:
+        resolved_start = dataset_start
+    if resolved_end > dataset_end:
+        resolved_end = dataset_end
+
+    if resolved_start > resolved_end:
+        raise ValueError(f"Backtest start date {resolved_start} is after end date {resolved_end}.")
+
+    if (resolved_end - resolved_start).days + 1 < min_window_days:
+        logger.warning(
+            "Requested backtest window is shorter than the default lookback window (%s days); "
+            "the optimizer may skip early weeks until enough history exists.",
+            min_window_days,
+        )
+
+    return resolved_start, resolved_end
+
+
 def run_backtest():
     db_path = os.environ.get("DB_PATH", os.path.join(os.path.dirname(os.path.dirname(__file__)), "results.db"))
     init_db(db_path)
     
     daily_file = os.environ.get("RETURNS_FILE", os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "processed", "daily_returns.csv"))
     returns_df = pd.read_csv(daily_file, index_col="date", parse_dates=["date"])
-    
-    start_date = pd.to_datetime(settings.start_date)
-    end_date = pd.to_datetime(settings.end_date)
+
+    start_date = os.environ.get("BACKTEST_START_DATE", settings.start_date)
+    end_date = os.environ.get("BACKTEST_END_DATE", settings.end_date)
+    start_date, end_date = resolve_backtest_bounds(returns_df, start_date, end_date, min_window_days=settings.window_days)
     
     mask = (returns_df.index >= start_date) & (returns_df.index <= end_date)
     backtest_period = returns_df.loc[mask]
@@ -85,7 +122,7 @@ def run_backtest():
     # State tracking
     prev_weights = {"markowitz": {}, "qaoa": {}}
     
-    with httpx.Client(timeout=30.0) as client:
+    with httpx.Client(timeout=settings.request_timeout) as client:
         for i in range(len(fridays)):
             reb_date = fridays[i]
             
@@ -97,15 +134,26 @@ def run_backtest():
                 continue
                 
             tickers = list(sigma_df.columns)
-            mu_hat = get_mu_hat(reb_date, tickers)
-            
+            try:
+                mu_hat = get_mu_hat(reb_date, tickers)
+            except MuHatUnavailableError as e:
+                logger.warning(f"Skipping {reb_date}: {e}")
+                continue
+
+            # mu_hat forecasts a MU_HAT_HORIZON_DAYS-day return while sigma_for_date is a daily
+            # covariance. Scale sigma once here so every arm gets both in the same units.
+            sigma = (sigma_df * MU_HAT_HORIZON_DAYS).values.tolist()
+            sigma_hash = compute_hash(sigma)
+            mu_hat_hash = compute_hash(mu_hat)
+            caps_hash = compute_hash(caps)
+
             req_id = f"reb-{reb_date.strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
             
             # Formulate the single request
             req = OptimizationRequest(
                 tickers=tickers,
                 mu_hat=mu_hat,
-                sigma=sigma_df.values.tolist(),
+                sigma=sigma,
                 risk_aversion=settings.risk_aversion,
                 caps=caps,
                 long_only=True,
@@ -149,11 +197,7 @@ def run_backtest():
                 # Transaction cost
                 tcost = (settings.tcost_bps / 10000.0) * turnover
                 net_ret = gross_ret - tcost
-                
-                
-                sigma_hash = compute_hash(sigma_df.values.tolist())
-                caps_hash = compute_hash(caps)
-                
+
                 res_dict = {
                     "request_id": res.request_id,
                     "rebalance_date": reb_date.strftime('%Y-%m-%d'),
@@ -165,6 +209,7 @@ def run_backtest():
                     "solver_status": res.solver_status,
                     "solve_time_ms": res.solve_time_ms,
                     "sigma_hash": sigma_hash,
+                    "mu_hat_hash": mu_hat_hash,
                     "caps_hash": caps_hash,
                     "risk_aversion": settings.risk_aversion
                 }
